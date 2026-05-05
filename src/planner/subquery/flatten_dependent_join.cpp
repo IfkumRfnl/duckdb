@@ -5,6 +5,8 @@
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/scalar/struct_functions.hpp"
 #include "duckdb/function/window/rows_functions.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -343,18 +345,59 @@ vector<ColumnBinding> FlattenDependentJoins::PushDownChild(unique_ptr<LogicalOpe
 void FlattenDependentJoins::AddAnyJoinConditions(LogicalDependentJoin &op,
                                                  const vector<ColumnBinding> &plan_columns) const {
 	// add the actual condition based on the ANY/ALL predicate
-	for (idx_t child_idx = 0; child_idx < op.expression_children.size(); child_idx++) {
-		auto left_expr = std::move(op.expression_children[child_idx]);
-		auto &child_type = op.child_types[child_idx];
-		auto &compare_type = op.child_targets[child_idx];
-		auto right_expr = BoundCastExpression::AddDefaultCastToType(
-		    make_uniq<BoundColumnRefExpression>(child_type, plan_columns[child_idx]), op.child_targets[child_idx]);
-		JoinCondition compare_cond(std::move(left_expr), std::move(right_expr), op.comparison_type);
+	// Special case: if we have a single struct child and multiple types,
+	// this means we kept the struct intact for ordered comparison (e.g., (a,b) < ANY(...))
+	// We need to construct a corresponding struct on the RHS from the subquery columns
+	if (op.expression_children.size() == 1 && op.child_types.size() > 1) {
+		vector<unique_ptr<Expression>> struct_children;
+		struct_children.reserve(op.child_types.size());
+		for (idx_t i = 0; i < op.child_types.size(); i++) {
+			auto &child_type = op.child_types[i];
+			auto &compare_type = op.child_targets[i];
+			auto colref = BoundCastExpression::AddDefaultCastToType(
+			    make_uniq<BoundColumnRefExpression>(child_type, plan_columns[i]), compare_type);
+			ExpressionBinder::PushCollation(binder.context, colref, compare_type);
+			struct_children.push_back(std::move(colref));
+		}
 
-		// push collations
-		ExpressionBinder::PushCollation(binder.context, compare_cond.LeftReference(), compare_type);
-		ExpressionBinder::PushCollation(binder.context, compare_cond.RightReference(), compare_type);
-		op.conditions.push_back(std::move(compare_cond));
+		FunctionBinder function_binder(binder);
+		auto struct_expr = function_binder.BindScalarFunction(RowFun::GetFunction(), std::move(struct_children));
+
+		JoinCondition cond(std::move(op.expression_children[0]), std::move(struct_expr), op.comparison_type);
+
+		// For struct comparisons, collation must be applied per child because
+		// the registered collation callbacks only handle scalar types.
+		auto &lhs_expr = cond.LeftReference();
+		BoundFunctionExpression *lhs_row = nullptr;
+		if (lhs_expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			lhs_row = &lhs_expr->Cast<BoundFunctionExpression>();
+		} else if (lhs_expr->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+			auto &cast_expr = lhs_expr->Cast<BoundCastExpression>();
+			if (cast_expr.child->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+				lhs_row = &cast_expr.child->Cast<BoundFunctionExpression>();
+			}
+		}
+		if (lhs_row && lhs_row->function.GetName() == "row") {
+			D_ASSERT(lhs_row->children.size() == op.child_targets.size());
+			for (idx_t i = 0; i < lhs_row->children.size(); i++) {
+				ExpressionBinder::PushCollation(binder.context, lhs_row->children[i], op.child_targets[i]);
+			}
+		}
+		op.conditions.push_back(std::move(cond));
+	} else {
+		for (idx_t child_idx = 0; child_idx < op.expression_children.size(); child_idx++) {
+			auto left_expr = std::move(op.expression_children[child_idx]);
+			auto &child_type = op.child_types[child_idx];
+			auto &compare_type = op.child_targets[child_idx];
+			auto right_expr = BoundCastExpression::AddDefaultCastToType(
+			    make_uniq<BoundColumnRefExpression>(child_type, plan_columns[child_idx]), op.child_targets[child_idx]);
+			JoinCondition compare_cond(std::move(left_expr), std::move(right_expr), op.comparison_type);
+
+			// push collations
+			ExpressionBinder::PushCollation(binder.context, compare_cond.LeftReference(), compare_type);
+			ExpressionBinder::PushCollation(binder.context, compare_cond.RightReference(), compare_type);
+			op.conditions.push_back(std::move(compare_cond));
+		}
 	}
 }
 

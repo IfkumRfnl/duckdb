@@ -6,6 +6,7 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_subquery_expression.hpp"
@@ -180,6 +181,7 @@ static unique_ptr<Expression> PlanUncorrelatedSubquery(Binder &binder, BoundSubq
 				auto &compare_type = expr.child_targets[i];
 				auto colref = BoundCastExpression::AddDefaultCastToType(
 				    make_uniq<BoundColumnRefExpression>(child_type, plan_columns[i]), compare_type);
+				ExpressionBinder::PushCollation(binder.context, colref, compare_type);
 				struct_children.push_back(std::move(colref));
 			}
 
@@ -189,9 +191,24 @@ static unique_ptr<Expression> PlanUncorrelatedSubquery(Binder &binder, BoundSubq
 
 			JoinCondition cond(std::move(expr.children[0]), std::move(struct_expr), expr.comparison_type);
 
-			// push collations
-			ExpressionBinder::PushCollation(binder.context, cond.LeftReference(), cond.GetLHS().GetReturnType());
-			ExpressionBinder::PushCollation(binder.context, cond.RightReference(), cond.GetRHS().GetReturnType());
+			// For struct comparisons, collation must be applied per child because
+			// the registered collation callbacks only handle scalar types.
+			auto &lhs_expr = cond.LeftReference();
+			BoundFunctionExpression *lhs_row = nullptr;
+			if (lhs_expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+				lhs_row = &lhs_expr->Cast<BoundFunctionExpression>();
+			} else if (lhs_expr->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+				auto &cast_expr = lhs_expr->Cast<BoundCastExpression>();
+				if (cast_expr.child->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+					lhs_row = &cast_expr.child->Cast<BoundFunctionExpression>();
+				}
+			}
+			if (lhs_row && lhs_row->function.GetName() == "row") {
+				D_ASSERT(lhs_row->children.size() == expr.child_targets.size());
+				for (idx_t i = 0; i < lhs_row->children.size(); i++) {
+					ExpressionBinder::PushCollation(binder.context, lhs_row->children[i], expr.child_targets[i]);
+				}
+			}
 
 			join->conditions.push_back(std::move(cond));
 		} else {

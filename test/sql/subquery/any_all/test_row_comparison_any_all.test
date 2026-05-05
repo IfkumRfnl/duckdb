@@ -246,3 +246,137 @@ query I
 SELECT (0, 0) < ANY(SELECT 1, 0);
 ----
 true
+
+# Test row comparison with type mismatch (issue #22304)
+# The left side has BIGINT columns, the right side has INTEGER constants
+statement ok
+CREATE TABLE tenk1 AS SELECT i AS unique1, i * 2 AS unique2 FROM range(10) t(i);
+
+query II
+SELECT unique1, unique2 FROM tenk1 WHERE ((unique1, unique2) < ANY (SELECT 2, 4));
+----
+0	0
+1	2
+
+query II
+SELECT unique1, unique2 FROM tenk1 WHERE ((unique1, unique2) <= ANY (SELECT 2, 4));
+----
+0	0
+1	2
+2	4
+
+query II
+SELECT unique1, unique2 FROM tenk1 WHERE ((unique1, unique2) > ANY (SELECT 2, 4));
+----
+3	6
+4	8
+5	10
+6	12
+7	14
+8	16
+9	18
+
+query II
+SELECT unique1, unique2 FROM tenk1 WHERE ((unique1, unique2) >= ANY (SELECT 2, 4));
+----
+2	4
+3	6
+4	8
+5	10
+6	12
+7	14
+8	16
+9	18
+
+# Test correlated row comparison with type mismatch
+query II
+SELECT unique1, unique2 FROM tenk1 t WHERE ((unique1, unique2) < ANY (SELECT t.unique1 + 1, t.unique2));
+----
+0	0
+1	2
+2	4
+3	6
+4	8
+5	10
+6	12
+7	14
+8	16
+9	18
+
+# Regression: mismatched row/subquery arity should produce a clean binder error,
+# not an internal crash (review of fix for issue #22304)
+statement error
+SELECT (1, 2) < ANY(SELECT 1, 2, 3);
+----
+Binder Error
+
+statement error
+SELECT (1, 2, 3) < ANY(SELECT 1, 2);
+----
+Binder Error
+
+statement error
+SELECT (1, 2) <= ALL(SELECT 1, 2, 3);
+----
+Binder Error
+
+statement ok
+DROP TABLE tenk1;
+
+# Test row comparison with collated string fields (review of fix for issue #22304)
+# Collation must be applied per struct child, not on the whole struct.
+statement ok
+PRAGMA default_collation='nocase';
+
+# Uncorrelated: with nocase, 'a' == 'A', so we compare the second field (1 < 2 = TRUE).
+# With binary collation this would be FALSE because 'a' > 'A'.
+query I
+SELECT ('a', 1) < ANY(SELECT 'A', 2);
+----
+true
+
+query I
+SELECT ('a', 1) < ALL(SELECT 'A', 2);
+----
+true
+
+# Uncorrelated: with nocase, 'B' > 'a', so this is FALSE.
+# With binary collation this would be TRUE because 'B' < 'a'.
+query I
+SELECT ('B', 1) < ANY(SELECT 'a', 2);
+----
+false
+
+statement ok
+CREATE TABLE collation_test(a VARCHAR, i INTEGER);
+
+statement ok
+INSERT INTO collation_test VALUES ('a', 1), ('A', 2), ('b', 3);
+
+# Correlated: for each row, compare (a, i) with ('B', 2).
+# With nocase:
+#   ('a', 1) < ('B', 2): 'a' < 'B' => TRUE  -> match
+#   ('A', 2) < ('B', 2): 'A' < 'B' => TRUE  -> match
+#   ('b', 3) < ('B', 2): 'b' == 'B', 3 < 2 = FALSE -> no match
+# With binary (bug): 'a' > 'B', so no rows would match at all.
+query II
+SELECT a, i FROM collation_test t WHERE (t.a, t.i) < ANY(SELECT 'B', 2);
+----
+a	1
+A	2
+
+# Correlated: compare with subquery expression using upper().
+# With nocase, all rows match because upper(t.a) compares equal to t.a.
+query II
+SELECT a, i FROM collation_test t WHERE (t.a, t.i) < ANY(SELECT upper(t.a), t.i + 1);
+----
+a	1
+A	2
+b	3
+
+# Clean up
+statement ok
+DROP TABLE collation_test;
+
+statement ok
+PRAGMA default_collation='';

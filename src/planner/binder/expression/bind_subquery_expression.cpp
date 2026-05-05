@@ -164,12 +164,32 @@ BindResult ExpressionBinder::BindExpression(SubqueryExpression &expr, idx_t dept
 		if (child_expressions.size() == 1 && bound_node.types.size() > 1 &&
 		    TypeIsUnnamedStruct(child_expressions[0]->GetReturnType())) {
 			// Keep the struct as-is for proper lexicographic row comparison
-			result->children.push_back(std::move(child_expressions[0]));
-			// Store all the subquery types - they will be used to construct the RHS struct during planning
-			for (auto &subquery_type : bound_node.types) {
-				result->child_types.push_back(subquery_type);
-				result->child_targets.push_back(subquery_type);
+			// Compute the common struct type child-by-child, mirroring the standard path
+			auto &child = child_expressions[0];
+			auto child_type = ExpressionBinder::GetExpressionReturnType(*child);
+			auto &left_children = StructType::GetChildTypes(child_type);
+			if (left_children.size() != bound_node.types.size()) {
+				throw BinderException(expr, "Subquery returns %zu columns - expected %zu", bound_node.types.size(),
+				                      left_children.size());
 			}
+			child_list_t<LogicalType> compare_children;
+			for (idx_t child_idx = 0; child_idx < bound_node.types.size(); child_idx++) {
+				auto &subquery_type = bound_node.types[child_idx];
+				LogicalType compare_type;
+				if (!LogicalType::TryGetMaxLogicalType(context, left_children[child_idx].second, subquery_type,
+				                                       compare_type)) {
+					throw BinderException(
+					    expr,
+					    "Cannot compare values of type %s and %s in IN/ANY/ALL clause - an explicit cast is required",
+					    left_children[child_idx].second.ToString(), subquery_type.ToString());
+				}
+				compare_children.emplace_back(left_children[child_idx].first, std::move(compare_type));
+				result->child_types.push_back(subquery_type);
+				result->child_targets.push_back(compare_children.back().second);
+			}
+			auto compare_struct_type = LogicalType::STRUCT(compare_children);
+			child = BoundCastExpression::AddCastToType(context, std::move(child), compare_struct_type);
+			result->children.push_back(std::move(child));
 		} else {
 			// Standard case: either no struct or struct was extracted into separate expressions
 			for (idx_t child_idx = 0; child_idx < child_expressions.size(); child_idx++) {
