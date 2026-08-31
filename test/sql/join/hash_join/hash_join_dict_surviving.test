@@ -479,3 +479,45 @@ LABEL_1	104880
 LABEL_2	104880
 LABEL_3	104880
 LABEL_4	104880
+
+# #24807: RIGHT join whose build is a RIGHT nested-loop join over two dict-emitting inner joins - the
+# unmatched-row scan of the NLJ fills the streamed columns with constant NULLs after matched chunks carried
+# a global dictionary, so the build stream is shape-unstable and the join must not narrow
+statement ok
+SET disabled_optimizers=''
+
+statement ok
+CREATE TABLE t__base (c_pk BIGINT NOT NULL, c_int BIGINT, c_big DECIMAL(38, 0), c_txt VARCHAR, c_date DATE, c_ts TIMESTAMP)
+
+statement ok
+INSERT INTO t__base VALUES (3, NULL, -7, NULL, DATE '2030-06-01', NULL), (8, -1, 1, 'x', DATE '2024-01-15', TIMESTAMP '1999-12-31 23:59:59')
+
+statement ok
+CREATE TABLE t25 AS SELECT c_pk, 1 AS flag FROM t__base
+
+statement ok
+CREATE VIEW t AS
+SELECT l.c_pk AS c_pk, l.c_int AS c_int, l.c_big AS c_big, l.c_txt AS c_txt, l.c_date AS c_date, l.c_ts AS c_ts
+FROM t__base l
+INNER JOIN t25 r ON l.c_pk = r.c_pk
+WHERE r.flag = 1
+
+query II
+SELECT t3.c_txt, t3.c_big
+FROM t t1
+RIGHT OUTER JOIN t t2 ON t1.c_int <= t2.c_int
+LEFT OUTER JOIN t t3 ON t1.c_date = t3.c_ts
+----
+NULL	NULL
+NULL	NULL
+
+# same shape with a FULL OUTER nested-loop join feeding the build
+query II
+SELECT t3.c_txt, t3.c_big
+FROM t t1
+FULL OUTER JOIN t t2 ON t1.c_int <= t2.c_int
+LEFT OUTER JOIN t t3 ON t1.c_date = t3.c_ts
+----
+NULL	NULL
+NULL	NULL
+NULL	NULL

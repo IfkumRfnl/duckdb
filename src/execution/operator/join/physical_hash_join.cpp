@@ -296,15 +296,43 @@ unique_ptr<JoinFilterGlobalState> JoinFilterPushdownInfo::GetGlobalState(ClientC
 	return result;
 }
 
-//! True iff the build subtree funnels multiple producer pipelines into one sink (UNION ALL, recursive CTE),
-//! breaking the "decide layout once on the first chunk" contract. Conservative: may over-exclude, never misses one.
-static bool BuildSideHasMultipleSources(const PhysicalOperator &op) {
-	if (op.type == PhysicalOperatorType::UNION || op.type == PhysicalOperatorType::RECURSIVE_CTE ||
-	    op.type == PhysicalOperatorType::RECURSIVE_KEY_CTE) {
+//! True iff the build subtree can deliver differently-shaped chunks for the same column, breaking the
+//! "decide layout once on the first chunk" contract: either several producer pipelines funnel into one sink
+//! (UNION ALL, recursive CTE), or an operator passes dictionaries through on some chunks but emits
+//! flat/constant vectors on others (see the cases below). Conservative: may over-exclude, never misses one.
+static bool BuildSideHasUnstableDictStream(const PhysicalOperator &op) {
+	switch (op.type) {
+	case PhysicalOperatorType::UNION:
+	case PhysicalOperatorType::RECURSIVE_CTE:
+	case PhysicalOperatorType::RECURSIVE_KEY_CTE:
 		return true;
+	case PhysicalOperatorType::CROSS_PRODUCT:
+		// the executor references the left chunk for some chunk pairs and constant-references it for others
+		return true;
+	case PhysicalOperatorType::UNNEST:
+		// pass-through columns flip between constant reference and slice per output chunk
+		return true;
+	case PhysicalOperatorType::HASH_JOIN:
+	case PhysicalOperatorType::NESTED_LOOP_JOIN:
+		// RIGHT/OUTER: the unmatched-build-row scan fills the streamed columns with constant NULLs after
+		// earlier chunks passed an upstream dictionary through
+		if (IsRightOuterJoin(op.Cast<PhysicalJoin>().join_type)) {
+			return true;
+		}
+		break;
+	case PhysicalOperatorType::BLOCKWISE_NL_JOIN:
+		// cross-product execution flips left columns between referenced and constant per chunk pair; only
+		// SEMI/ANTI build their output exclusively from input slices
+		if (op.Cast<PhysicalJoin>().join_type != JoinType::SEMI &&
+		    op.Cast<PhysicalJoin>().join_type != JoinType::ANTI) {
+			return true;
+		}
+		break;
+	default:
+		break;
 	}
 	for (const auto &child : op.children) {
-		if (BuildSideHasMultipleSources(child.get())) {
+		if (BuildSideHasUnstableDictStream(child.get())) {
 			return true;
 		}
 	}
@@ -339,9 +367,10 @@ public:
 		perfect_join_executor = make_uniq<PerfectHashJoinExecutor>(op, *hash_table);
 		auto use_perfect_hash = CanUsePerfectHashJoin(op, *perfect_join_executor);
 		can_use_perfect_hash = use_perfect_hash;
-		// A multi-source build side (UNION ALL / recursive CTE) feeds the sink from several producers,
-		// disqualifying dict-surviving. Computed once from the static plan; cannot change at runtime.
-		build_side_multi_source = BuildSideHasMultipleSources(op.children[1].get());
+		// A build side whose stream can change per-column vector shape mid-stream (multi-pipeline funnel or
+		// shape-unstable operator) disqualifies dict-surviving. Computed once from the static plan; cannot
+		// change at runtime.
+		build_side_unstable_dict_stream = BuildSideHasUnstableDictStream(op.children[1].get());
 		// For external hash join
 		external = Settings::Get<DebugForceExternalSetting>(context);
 		// Set probe types
@@ -456,9 +485,10 @@ public:
 	//! True iff this join may use perfect-hash-join at Finalize. PHJ's FullScanHashTable reads payload at native
 	//! width, so it disables dict-surviving slot narrowing.
 	bool can_use_perfect_hash = false;
-	//! True iff the build subtree funnels multiple producer pipelines into this sink (UNION ALL /
-	//! recursive CTE); disables dict-surviving because the first-chunk layout election is unsound there.
-	bool build_side_multi_source = false;
+	//! True iff the build subtree can deliver differently-shaped chunks for the same column (see
+	//! BuildSideHasUnstableDictStream); disables dict-surviving because the first-chunk layout election
+	//! is unsound there.
+	bool build_side_unstable_dict_stream = false;
 };
 
 unique_ptr<JoinFilterLocalState> JoinFilterPushdownInfo::GetLocalState(JoinFilterGlobalState &gstate) const {
@@ -576,12 +606,12 @@ static shared_ptr<TupleDataLayout> BuildJoinLayout(const vector<LogicalType> &co
 
 //! Join-level gate: shape-only eligibility checks, mirroring the dict-emission path plus a PHJ exclusion
 static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTable &ht, bool can_use_perfect_hash,
-                                    bool build_side_multi_source) {
+                                    bool build_side_unstable_dict_stream) {
 	// external is safe here: the dictionary is an in-memory self-owned copy and the index is a plain row-store
 	// column, so a spill/repartition preserves both (unlike the pointer-embedding dict-emission/compressed-probe paths)
-	// a multi-source build can deliver a later chunk flat or as a different dictionary under the
-	// already-narrowed slot, so disqualify the whole join (see BuildSideHasMultipleSources)
-	if (build_side_multi_source) {
+	// an unstable-shape build stream can deliver a later chunk flat or as a different dictionary under the
+	// already-narrowed slot, so disqualify the whole join (see BuildSideHasUnstableDictStream)
+	if (build_side_unstable_dict_stream) {
 		return false;
 	}
 	// SINGLE joins need FlatVector::SetNull on unmatched rows; dictionary vectors cannot supply it
@@ -633,7 +663,7 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 	const auto &build_types = lstate.hash_table->build_types;
 	layout_gate.dict_index_width.assign(build_types.size(), 0);
 
-	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, can_use_perfect_hash, build_side_multi_source)) {
+	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, can_use_perfect_hash, build_side_unstable_dict_stream)) {
 		// Per-column width decision lives on the JHT (GetDictSurvivingIndexWidth); feed it each arriving vector.
 		for (idx_t col = 0; col < build_types.size(); col++) {
 			if (col >= payload_chunk.ColumnCount()) {

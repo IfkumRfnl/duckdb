@@ -554,7 +554,7 @@ void JoinHashTable::PinDictSurvivingColumn(idx_t build_col_idx, const Vector &in
 	if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR || DictionaryVector::DictionaryId(incoming).empty() ||
 	    !DictionaryVector::IsGlobalDictionary(incoming)) {
 		throw InternalException("dict-surviving join: narrowed column %llu received a "
-		                        "non-global-dictionary chunk; build pipeline is not single-source",
+		                        "non-global-dictionary chunk; build stream is not dictionary-stable",
 		                        static_cast<uint64_t>(build_col_idx));
 	}
 	const auto &entry = incoming.Buffer().Cast<DictionaryBuffer>().GetEntry();
